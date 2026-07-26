@@ -7,10 +7,16 @@ which tests failed, and ccache's own -s output, and writes one JSON file
 tying it together. Parsing the log is the only non-trivial part here: a
 check-world run mixes two different test runners in one log.
 
-  - pg_regress (core suite and each contrib module) prints one line per
-    test: "test NAME ... ok" or "test NAME ... FAILED", after a header line
-    "# +++ regress check in DIR +++" naming the suite directory. Every such
-    line, plus every TAP file seen, is also recorded as an executed test.
+  - pg_regress (core suite, isolation, each contrib module) prints one line
+    per test, in one of three formats depending on the era. PG <= 15 run
+    serially: "test NAME ... ok". PG <= 15 inside a parallel group, which
+    is most of the core suite: the same thing indented five spaces, with no
+    "test" prefix. PG >= 16: TAP, "ok 1  - NAME  353 ms" or
+    "not ok 3  + NAME  41 ms". All three are matched. A header line
+    "# +++ regress check in DIR +++" names the suite directory, but only
+    from PG 15 on - older majors print no such marker, so their tests all
+    end up under one flat prefix. Every test line, plus every TAP file
+    seen, is also recorded as an executed test.
   - prove-driven TAP suites print progress per .pl file, then on failure a
     "Test Summary Report" block with one line per failing file:
     "FILE.pl (Wstat: N Tests: N Failed: N)". If the run gets killed by the
@@ -28,14 +34,27 @@ import re
 import sys
 
 MAX_FAILED = 200
-MAX_EXECUTED = 1000
+MAX_EXECUTED = 2000
+MAX_NAME = 200
 VALID_STATUSES = {
     "success", "build_failed", "build_timeout",
     "tests_failed", "tests_timeout", "infra_error",
 }
 
-SUITE_HEADER_RE = re.compile(r"#\s*\+\+\+ (?:regress|tap) check in (\S+) \+\+\+")
-REGRESS_LINE_RE = re.compile(r"^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED)\b")
+SUITE_HEADER_RE = re.compile(
+    r"#\s*\+\+\+ (?:regress|isolation|tap) check in (\S+) \+\+\+"
+)
+# three pg_regress eras, all still in use across our era images. "failed
+# (ignored)" is a third status pre-16 (an --ignore listed test whose output
+# differed): it ran, and it does not fail the suite. PG 16 dropped --ignore
+# along with the old line format.
+REGRESS_SERIAL_RE = re.compile(
+    r"^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED|failed \(ignored\))"
+)
+REGRESS_PARALLEL_RE = re.compile(
+    r"^ {5}(\S+)\s+\.\.\.\s+(ok|FAILED|failed \(ignored\))"
+)
+REGRESS_TAP_RE = re.compile(r"^(not )?ok\s+\d+\s+[-+]\s+(\S+)\s+\d+ ms\s*$")
 TAP_FILE_RE = re.compile(r"\bt/(\S+?)\.pl\b")
 PROVE_SUMMARY_RE = re.compile(
     r"^(\S+)\.pl\s+\(Wstat:\s*(\d+)(?:\s*\(exited\s+\d+\))?\s+Tests:\s*\d+\s+Failed:\s*(\d+)\)"
@@ -43,12 +62,17 @@ PROVE_SUMMARY_RE = re.compile(
 NOT_OK_RE = re.compile(r"^(?:#\s*)?not ok\b")
 
 
-def _add(failed, seen, name):
+def _add(items, seen, name, cap):
+    name = name[:MAX_NAME]
     if name in seen:
         return
     seen.add(name)
-    if len(failed) < MAX_FAILED:
-        failed.append(name)
+    if len(items) < cap:
+        items.append(name)
+
+
+def _prefix(suite_dir, default):
+    return suite_dir.rsplit("/", 1)[-1] if suite_dir else default
 
 
 def parse_check_world(text):
@@ -57,13 +81,6 @@ def parse_check_world(text):
     seen = set()
     executed = []
     executed_seen = set()
-
-    def _add_executed(name):
-        if name in executed_seen:
-            return
-        executed_seen.add(name)
-        if len(executed) < MAX_EXECUTED:
-            executed.append(name)
 
     suite_dir = None
     tap_file = None
@@ -76,42 +93,60 @@ def parse_check_world(text):
             tap_file = None
             continue
 
-        m = REGRESS_LINE_RE.match(line)
+        # PG <= 15. The five-space indent is the only thing marking a test
+        # inside a parallel group, so that one has to see the raw line.
+        m = REGRESS_SERIAL_RE.match(line) or REGRESS_PARALLEL_RE.match(raw)
         if m:
-            prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "regress"
-            name = f"{prefix}/{m.group(1)}"
-            _add_executed(name)
+            name = f"{_prefix(suite_dir, 'regress')}/{m.group(1)}"
+            _add(executed, executed_seen, name, MAX_EXECUTED)
             if m.group(2) == "FAILED":
-                _add(failed, seen, name)
+                _add(failed, seen, name, MAX_FAILED)
+            continue
+
+        # PG >= 16, where pg_regress emits TAP ('-' serial, '+' parallel).
+        # Has to come before the bare "not ok" fallback below, which would
+        # otherwise charge these to whatever TAP file was last seen. The
+        # trailing runtime is what tells these apart from prove's own
+        # progress lines and from a plain "not ok 3 - description" subtest,
+        # so keep it anchored.
+        m = REGRESS_TAP_RE.match(line)
+        if m:
+            name = f"{_prefix(suite_dir, 'regress')}/{m.group(2)}"
+            _add(executed, executed_seen, name, MAX_EXECUTED)
+            if m.group(1):
+                _add(failed, seen, name, MAX_FAILED)
             continue
 
         m = PROVE_SUMMARY_RE.match(line)
         if m:
-            prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "tap"
+            prefix = _prefix(suite_dir, "tap")
             stem = m.group(1)
             if stem.startswith("t/"):
                 stem = stem[2:]
-            _add_executed(f"{prefix}/{stem}")
+            _add(executed, executed_seen, f"{prefix}/{stem}", MAX_EXECUTED)
             # a nonzero Wstat means the file bailed out or crashed before
             # prove could count subtests - "Failed: 0" in that case does not
             # mean nothing went wrong, it means nothing got the chance to
             wstat_nonzero = m.group(2) != "0"
             if wstat_nonzero or int(m.group(3)) > 0:
-                _add(failed, seen, f"{prefix}/{stem}")
+                _add(failed, seen, f"{prefix}/{stem}", MAX_FAILED)
             continue
 
+        # relies on the build running make with -s: an unquiet make echoes
+        # the prove recipe, glob-expanded to every t/*.pl in the suite, and
+        # each of those names would land here as an executed test.
         m = TAP_FILE_RE.search(line)
         if m:
             tap_file = m.group(1)
-            prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "tap"
-            _add_executed(f"{prefix}/{tap_file}")
+            prefix = _prefix(suite_dir, "tap")
+            _add(executed, executed_seen, f"{prefix}/{tap_file}", MAX_EXECUTED)
 
         if NOT_OK_RE.match(line) and tap_file:
-            prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "tap"
+            prefix = _prefix(suite_dir, "tap")
             # only a fallback for logs truncated before the summary block -
             # the Test Summary Report branch above already caught this file
             # if the log ran to completion, and _add is a no-op on repeats.
-            _add(failed, seen, f"{prefix}/{tap_file}")
+            _add(failed, seen, f"{prefix}/{tap_file}", MAX_FAILED)
 
     return executed, failed
 
@@ -204,12 +239,13 @@ def main(argv):
         # (no per-file summary line if it dies before any subtest ran) -
         # the workflow finds these by walking the test log directory
         # instead, and passes the names here as a plain space-separated
-        # list.
+        # list. A test that bailed out still ran, so these count as
+        # executed too.
         seen = set(failed)
+        executed_seen = set(executed)
         for name in read_file(args.extra_failed).split():
-            if name not in seen and len(failed) < MAX_FAILED:
-                seen.add(name)
-                failed.append(name)
+            _add(failed, seen, name, MAX_FAILED)
+            _add(executed, executed_seen, name, MAX_EXECUTED)
 
     hit, miss = parse_ccache(read_file(args.ccache_log))
 
