@@ -38,12 +38,38 @@ jobs:
       build_ok: ${{ steps.build.outputs.ok }}
       tests_ok: ${{ steps.test.outputs.ok || 'false' }}
       status: ${{ steps.collect.outputs.status }}
+      image_description: ${{ steps.describe.outputs.text }}
     steps:
       - name: Check out patch branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      # Human-facing description for the published image: what the patch
+      # adds (its commit subjects) on which base version. HEAD^ skips our
+      # own CI stub commit, which is always the branch tip. Built here
+      # because only this job has the git history. The subjects are
+      # mailing-list text, i.e. untrusted - downstream this only ever
+      # travels as a job output into an action input, never into a shell
+      # script in a job holding a write token.
+      - name: Build image description
+        id: describe
+        shell: bash
+        run: |
+          version=$(git show ${{ inputs.base_sha }}:configure 2>/dev/null \
+            | sed -n "s/^PACKAGE_VERSION='\([^']*\)'.*/\1/p" | head -n1 || true)
+          subjects=$(git log --reverse --format=%s ${{ inputs.base_sha }}..HEAD^ 2>/dev/null \
+            | awk 'NR>1{printf "; "}{printf "%s",$0}' || true)
+          if [ "${#subjects}" -gt 300 ]; then
+            subjects="${subjects:0:297}..."
+          fi
+          desc="PostgreSQL ${version:-${{ inputs.pg_major }}}"
+          if [ -n "$subjects" ]; then
+            desc="$desc + $subjects"
+          fi
+          desc="$desc (hackorum topic ${{ inputs.topic_id }}, cassert debug build)"
+          printf 'text=%s\n' "$desc" >> "$GITHUB_OUTPUT"
 
       # Pulled in after the main checkout, since actions/checkout clears the
       # workspace first. Only the result parser lives here, not baked into
@@ -363,7 +389,7 @@ jobs:
             "head_sha": "${{ github.sha }}",
             "pg_major": ${{ inputs.pg_major }},
             "run_id": ${{ github.run_id }},
-            "note": "cassert/debug build for trying this patch - not built or configured for benchmarking"
+            "note": "cassert/debug build for trying this patch"
           }
           JSON
 
@@ -389,7 +415,6 @@ jobs:
           RUN set -eux; sed -ri "s!^#?(listen_addresses)\s*=\s*\S+.*!\1 = '*'!" /usr/local/pgsql/share/postgresql/postgresql.conf.sample; grep -qxF "listen_addresses = '*'" /usr/local/pgsql/share/postgresql/postgresql.conf.sample
           LABEL org.opencontainers.image.source="https://github.com/${{ github.repository }}"
           LABEL org.opencontainers.image.revision="${{ github.sha }}"
-          LABEL org.opencontainers.image.description="hackorum patch CI build, topic ${{ inputs.topic_id }}, pg${{ inputs.pg_major }}, cassert debug build, not for benchmarking"
           LABEL dev.hackorum.topic-id="${{ inputs.topic_id }}"
           LABEL dev.hackorum.message-index="${{ inputs.message_index }}"
           LABEL dev.hackorum.base-sha="${{ inputs.base_sha }}"
@@ -403,6 +428,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The description label is set here, not in the Dockerfile above -
+      # it carries patch commit subjects, which are untrusted mailing-list
+      # text, and this job holds a write token. An action input is plain
+      # data; a ${{ }} in the Dockerfile heredoc would splice that text
+      # into a shell script.
       - name: Build and push patch image
         id: push
         uses: docker/build-push-action@v6
@@ -410,6 +440,8 @@ jobs:
           context: ctx
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/postgres-patch:t${{ inputs.topic_id }}
+          labels: |
+            org.opencontainers.image.description=${{ needs.build-and-test.outputs.image_description }}
 
       # Proves the published image actually runs, not just that it built -
       # entrypoint, initdb, gosu, install-tree layout and PATH all have to
