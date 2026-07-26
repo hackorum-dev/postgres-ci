@@ -224,6 +224,7 @@ class Caps(unittest.TestCase):
             serial("x" * 300, "FAILED", 1),
         ])
         executed, failed = cr.parse_check_world(log)
+        self.assertEqual(cr.MAX_NAME, 64)
         self.assertEqual(len(executed[0]), cr.MAX_NAME)
         self.assertEqual(executed, failed)
 
@@ -248,14 +249,17 @@ class Main(unittest.TestCase):
                 "--out", out_path,
             ])
             with open(out_path) as f:
-                return json.load(f)
+                return f.read()
+
+    def parse_main(self, log, extra):
+        return json.loads(self.run_main(log, extra))
 
     def test_extra_failed_lands_in_both_lists(self):
         log = "\n".join([
             "# +++ regress check in src/test/regress +++",
             serial("boolean", "ok    ", 38),
         ])
-        result = self.run_main(log, "recovery/001_stream_rep subscription/013_x\n")
+        result = self.parse_main(log, "recovery/001_stream_rep subscription/013_x\n")
         self.assertEqual(result["status"], "tests_failed")
         self.assertEqual(
             result["tests"]["failed"],
@@ -271,9 +275,25 @@ class Main(unittest.TestCase):
             "# +++ tap check in src/test/recovery +++",
             "t/001_stream_rep.pl (Wstat: 0 Tests: 5 Failed: 1)",
         ])
-        result = self.run_main(log, "recovery/001_stream_rep\n")
+        result = self.parse_main(log, "recovery/001_stream_rep\n")
         self.assertEqual(result["tests"]["failed"], ["recovery/001_stream_rep"])
         self.assertEqual(result["tests"]["executed"], ["recovery/001_stream_rep"])
+
+    def test_worst_case_payload_fits_the_reader_budget(self):
+        # the reader rejects an oversize payload outright instead of trimming
+        # it, so the caps have to guarantee the fit. Every name here is
+        # unique in its leading digits and long enough to hit MAX_NAME, which
+        # is the largest result.json the caps allow.
+        reader_max_bytes = 256 * 1024
+        lines = ["# +++ regress check in src/test/regress +++"]
+        for i in range(cr.MAX_EXECUTED + 500):
+            lines.append(serial("%04d%s" % (i, "x" * cr.MAX_NAME), "FAILED", 1))
+        text = self.run_main("\n".join(lines), "")
+        result = json.loads(text)
+        self.assertEqual(len(result["tests"]["executed"]), cr.MAX_EXECUTED)
+        self.assertEqual(len(result["tests"]["failed"]), cr.MAX_FAILED)
+        self.assertEqual({len(n) for n in result["tests"]["executed"]}, {cr.MAX_NAME})
+        self.assertLess(len(text.encode()), reader_max_bytes)
 
 
 if __name__ == "__main__":

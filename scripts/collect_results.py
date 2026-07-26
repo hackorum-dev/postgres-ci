@@ -35,7 +35,13 @@ import sys
 
 MAX_FAILED = 200
 MAX_EXECUTED = 2000
-MAX_NAME = 200
+# the reader (Rails ResultPayload::MAX_BYTES, 256KB) rejects an oversize
+# payload outright rather than trimming it, which would surface as a bogus
+# infra_error, so fitting is this side's job: MAX_EXECUTED + MAX_FAILED
+# names of MAX_NAME chars each, serialized at indent=2, must stay under
+# that. At 64 the worst legal payload is ~160KB; the longest real test
+# identifier is around 30 chars, so nothing genuine gets cut.
+MAX_NAME = 64
 VALID_STATUSES = {
     "success", "build_failed", "build_timeout",
     "tests_failed", "tests_timeout", "infra_error",
