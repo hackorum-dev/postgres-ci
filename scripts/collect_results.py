@@ -9,7 +9,8 @@ check-world run mixes two different test runners in one log.
 
   - pg_regress (core suite and each contrib module) prints one line per
     test: "test NAME ... ok" or "test NAME ... FAILED", after a header line
-    "# +++ regress check in DIR +++" naming the suite directory.
+    "# +++ regress check in DIR +++" naming the suite directory. Every such
+    line, plus every TAP file seen, is also recorded as an executed test.
   - prove-driven TAP suites print progress per .pl file, then on failure a
     "Test Summary Report" block with one line per failing file:
     "FILE.pl (Wstat: N Tests: N Failed: N)". If the run gets killed by the
@@ -27,13 +28,14 @@ import re
 import sys
 
 MAX_FAILED = 200
+MAX_EXECUTED = 1000
 VALID_STATUSES = {
     "success", "build_failed", "build_timeout",
     "tests_failed", "tests_timeout", "infra_error",
 }
 
 SUITE_HEADER_RE = re.compile(r"#\s*\+\+\+ (?:regress|tap) check in (\S+) \+\+\+")
-REGRESS_FAIL_RE = re.compile(r"^test\s+(\S+)\s+\.\.\.\s+FAILED\b")
+REGRESS_LINE_RE = re.compile(r"^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED)\b")
 TAP_FILE_RE = re.compile(r"\bt/(\S+?)\.pl\b")
 PROVE_SUMMARY_RE = re.compile(
     r"^(\S+)\.pl\s+\(Wstat:\s*(\d+)(?:\s*\(exited\s+\d+\))?\s+Tests:\s*\d+\s+Failed:\s*(\d+)\)"
@@ -50,9 +52,19 @@ def _add(failed, seen, name):
 
 
 def parse_check_world(text):
-    """Return a sorted list of failed test identifiers, capped at MAX_FAILED."""
+    """Return (executed, failed) test identifier lists, each capped and deduped."""
     failed = []
     seen = set()
+    executed = []
+    executed_seen = set()
+
+    def _add_executed(name):
+        if name in executed_seen:
+            return
+        executed_seen.add(name)
+        if len(executed) < MAX_EXECUTED:
+            executed.append(name)
+
     suite_dir = None
     tap_file = None
     for raw in text.splitlines():
@@ -64,29 +76,35 @@ def parse_check_world(text):
             tap_file = None
             continue
 
-        m = REGRESS_FAIL_RE.match(line)
+        m = REGRESS_LINE_RE.match(line)
         if m:
             prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "regress"
-            _add(failed, seen, f"{prefix}/{m.group(1)}")
+            name = f"{prefix}/{m.group(1)}"
+            _add_executed(name)
+            if m.group(2) == "FAILED":
+                _add(failed, seen, name)
             continue
 
         m = PROVE_SUMMARY_RE.match(line)
         if m:
+            prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "tap"
+            stem = m.group(1)
+            if stem.startswith("t/"):
+                stem = stem[2:]
+            _add_executed(f"{prefix}/{stem}")
             # a nonzero Wstat means the file bailed out or crashed before
             # prove could count subtests - "Failed: 0" in that case does not
             # mean nothing went wrong, it means nothing got the chance to
             wstat_nonzero = m.group(2) != "0"
             if wstat_nonzero or int(m.group(3)) > 0:
-                prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "tap"
-                stem = m.group(1)
-                if stem.startswith("t/"):
-                    stem = stem[2:]
                 _add(failed, seen, f"{prefix}/{stem}")
             continue
 
         m = TAP_FILE_RE.search(line)
         if m:
             tap_file = m.group(1)
+            prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "tap"
+            _add_executed(f"{prefix}/{tap_file}")
 
         if NOT_OK_RE.match(line) and tap_file:
             prefix = suite_dir.rsplit("/", 1)[-1] if suite_dir else "tap"
@@ -95,7 +113,7 @@ def parse_check_world(text):
             # if the log ran to completion, and _add is a no-op on repeats.
             _add(failed, seen, f"{prefix}/{tap_file}")
 
-    return failed
+    return executed, failed
 
 
 def parse_ccache(text):
@@ -179,9 +197,9 @@ def main(argv):
     if status not in VALID_STATUSES:
         raise SystemExit(f"internal error: computed invalid status {status!r}")
 
-    failed = []
+    executed, failed = [], []
     if build_ok:
-        failed = parse_check_world(read_file(args.check_world_log))
+        executed, failed = parse_check_world(read_file(args.check_world_log))
         # some old PG majors' prove never names the file that bailed out
         # (no per-file summary line if it dies before any subtest ran) -
         # the workflow finds these by walking the test log directory
@@ -210,6 +228,7 @@ def main(argv):
             "seconds": args.tests_seconds if build_ok else 0,
             "timed_out": tests_timeout,
             "failed": failed,
+            "executed": executed,
         },
         "ccache": {"hit": hit, "miss": miss},
     }
