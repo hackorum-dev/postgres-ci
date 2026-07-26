@@ -1,0 +1,250 @@
+name: Image contract check
+
+# Verifies the user-facing contract of already-published postgres-patch
+# images: the thing a reviewer actually does ("docker run this, connect,
+# try the patch"), not just that the server process starts. The publish
+# job in patch-ci.yml already smoke-tests every image it pushes (boots,
+# initdb runs, one query works) - this workflow goes further, against a
+# fixed sample of already-published images, since re-running the full
+# contract on every one of several thousand patch images would burn far
+# more runner time than the check is worth.
+#
+# Trigger mirrors build-era-images.yml: a marker on the pushed commit's
+# subject line, [contract]. No marker runs the cheap matrix job but tests
+# nothing. workflow_dispatch exists for whoever has a write-capable token;
+# the token this repo's automation carries is read-only and cannot use it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      images:
+        description: "Space separated image tags to test (empty = default trial set)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.pick.outputs.images }}
+    steps:
+      - id: pick
+        env:
+          IMAGES_INPUT: ${{ inputs.images }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re
+
+          # Default sample: the nine images from the recent trial batch,
+          # recorded in patch_ci_runs.image_ref on the database side. Kept
+          # here as a plain tag list, not fetched live - this workflow has
+          # no database access and shouldn't need any to run.
+          DEFAULT_MAJORS = {
+              "t37759": 10, "t37764": 11, "t38263": 11, "t40413": 14,
+              "t42603": 14, "t44817": 15, "t44825": 20, "t50617": 18,
+              "t52674": 19,
+          }
+
+          want = os.environ.get("IMAGES_INPUT", "").strip()
+          if want:
+              tags = want.split()
+          else:
+              msg = os.environ.get("HEAD_COMMIT_MESSAGE", "")
+              # only the subject line counts - see build-era-images.yml for
+              # why (a squashed merge's body absorbs old commit subjects,
+              # which must not resurrect a stale marker there)
+              subject = msg.splitlines()[0] if msg else ""
+              if "[contract]" not in subject:
+                  print("images=[]")
+                  raise SystemExit(0)
+              tags = list(DEFAULT_MAJORS.keys())
+
+          out = []
+          for tag in tags:
+              out.append({
+                  "topic": tag,
+                  "major": DEFAULT_MAJORS.get(tag),
+                  "ref": f"ghcr.io/hackorum-dev/postgres-patch:{tag}",
+              })
+          print("images=" + json.dumps(out))
+          PY
+
+  contract:
+    needs: matrix
+    if: ${{ needs.matrix.outputs.images != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.matrix.outputs.images) }}
+    name: contract (${{ matrix.image.topic }}, pg${{ matrix.image.major }})
+    env:
+      IMAGE_REF: ${{ matrix.image.ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-latest usually ships one already, but the contract check for
+      # case 1 below depends on it, so check rather than assume.
+      - name: Ensure a psql client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          psql --version
+
+      # This is the actual instruction a reviewer is given: run the image,
+      # nothing else, connect. It is also the one path that exercises our
+      # deliberate deviation from the official image -
+      # POSTGRES_HOST_AUTH_METHOD=trust baked in so the image is usable
+      # with zero setup - and, before this workflow, the one path nothing
+      # ever tested end to end from outside the container.
+      - name: "Case 1: bare run, no env vars, connect from host"
+        id: case1
+        continue-on-error: true
+        run: |
+          docker run -d --name bare -p 5432:5432 "$IMAGE_REF"
+          bash scripts/wait_pg_ready.sh bare 5432 postgres 60 || { docker rm -f bare; exit 1; }
+          if ! psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -c 'select 1'; then
+            echo "host psql could not connect to a bare 'docker run', trust default"
+            docker logs bare
+            docker rm -f bare
+            exit 1
+          fi
+          docker rm -f bare
+
+      # The official image's env contract: password/user/db all set to
+      # something other than the default, and the server actually comes up
+      # with that user owning that database.
+      - name: "Case 2: POSTGRES_PASSWORD/USER/DB all set"
+        id: case2
+        continue-on-error: true
+        run: |
+          docker run -d --name userdb -p 5433:5432 \
+            -e POSTGRES_PASSWORD=contractpw \
+            -e POSTGRES_USER=contractuser \
+            -e POSTGRES_DB=contractdb \
+            "$IMAGE_REF"
+          bash scripts/wait_pg_ready.sh userdb 5433 contractuser 60 || { docker rm -f userdb; exit 1; }
+          if ! PGPASSWORD=contractpw psql -h 127.0.0.1 -p 5433 -U contractuser -d contractdb \
+            -c 'select current_user, current_database()'; then
+            echo "could not connect as contractuser to contractdb"
+            docker logs userdb
+            docker rm -f userdb
+            exit 1
+          fi
+          docker rm -f userdb
+
+      # First-boot init hooks: a mounted .sql file under
+      # /docker-entrypoint-initdb.d must run once, before the server opens
+      # up for real traffic.
+      - name: "Case 3: docker-entrypoint-initdb.d runs on first boot"
+        id: case3
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/initdb.d
+          cat > /tmp/initdb.d/00-init.sql <<'SQL'
+          create table contract_probe (id int, note text);
+          insert into contract_probe values (1, 'contract-init');
+          SQL
+          docker run -d --name initdbtest -p 5434:5432 \
+            -e POSTGRES_PASSWORD=smoke \
+            -v /tmp/initdb.d:/docker-entrypoint-initdb.d:ro \
+            "$IMAGE_REF"
+          bash scripts/wait_pg_ready.sh initdbtest 5434 postgres 60 || { docker rm -f initdbtest; exit 1; }
+          row="$(PGPASSWORD=smoke psql -h 127.0.0.1 -p 5434 -U postgres -tAc \
+            "select note from contract_probe where id = 1")"
+          if [ "$row" != "contract-init" ]; then
+            echo "init script did not run, or table is missing its row: got '$row'"
+            docker logs initdbtest
+            docker rm -f initdbtest
+            exit 1
+          fi
+          docker rm -f initdbtest
+
+      # PGDATA/VOLUME wiring: data written by one container must survive
+      # that container's death and show up again under a second container
+      # on the same named volume, and the second boot must not initdb over
+      # it.
+      - name: "Case 4: named volume persists across container recreation"
+        id: case4
+        continue-on-error: true
+        run: |
+          docker volume create contract_vol >/dev/null
+          cleanup() { docker rm -f persist1 persist2 >/dev/null 2>&1; docker volume rm contract_vol >/dev/null 2>&1; }
+
+          docker run -d --name persist1 -p 5435:5432 -e POSTGRES_PASSWORD=smoke \
+            -v contract_vol:/var/lib/postgresql/data "$IMAGE_REF"
+          bash scripts/wait_pg_ready.sh persist1 5435 postgres 60 || { cleanup; exit 1; }
+          if ! PGPASSWORD=smoke psql -h 127.0.0.1 -p 5435 -U postgres \
+            -c 'create table persisted(id int); insert into persisted values (42);'; then
+            echo "could not write through the first container"
+            docker logs persist1
+            cleanup
+            exit 1
+          fi
+          docker stop persist1 >/dev/null
+          docker rm persist1 >/dev/null
+
+          docker run -d --name persist2 -p 5435:5432 -e POSTGRES_PASSWORD=smoke \
+            -v contract_vol:/var/lib/postgresql/data "$IMAGE_REF"
+          bash scripts/wait_pg_ready.sh persist2 5435 postgres 60 || { cleanup; exit 1; }
+          row="$(PGPASSWORD=smoke psql -h 127.0.0.1 -p 5435 -U postgres -tAc 'select id from persisted')"
+          if [ "$row" != "42" ]; then
+            echo "data did not survive stop/rm/recreate on the same volume: got '$row'"
+            docker logs persist2
+            cleanup
+            exit 1
+          fi
+          cleanup
+
+      # A contrib module actually shipped and works. install-world-bin
+      # (or, pre-15, a separate contrib build/install) is specifically what
+      # is supposed to make patches touching contrib testable this way;
+      # nothing else in the pipeline checks that contrib made it into the
+      # published image at all. pg_trgm needs no shared_preload_libraries,
+      # so this only exercises CREATE EXTENSION plus one function call.
+      - name: "Case 5: a contrib extension loads (pg_trgm)"
+        id: case5
+        continue-on-error: true
+        run: |
+          docker run -d --name contrib1 -p 5436:5432 -e POSTGRES_PASSWORD=smoke "$IMAGE_REF"
+          bash scripts/wait_pg_ready.sh contrib1 5436 postgres 60 || { docker rm -f contrib1; exit 1; }
+          if ! PGPASSWORD=smoke psql -h 127.0.0.1 -p 5436 -U postgres \
+            -c "create extension pg_trgm; select similarity('postgres', 'postgre') > 0;"; then
+            echo "pg_trgm did not install or did not run"
+            docker logs contrib1
+            docker rm -f contrib1
+            exit 1
+          fi
+          docker rm -f contrib1
+
+      # Each case above runs regardless of an earlier one failing
+      # (continue-on-error), so one broken case doesn't hide the rest.
+      # This step is what actually fails the job, once every case has had
+      # its turn.
+      - name: Summarize contract results
+        if: always()
+        env:
+          CASE1: ${{ steps.case1.outcome }}
+          CASE2: ${{ steps.case2.outcome }}
+          CASE3: ${{ steps.case3.outcome }}
+          CASE4: ${{ steps.case4.outcome }}
+          CASE5: ${{ steps.case5.outcome }}
+        run: |
+          echo "case1 (bare run, trust default):        $CASE1"
+          echo "case2 (password/user/db env):            $CASE2"
+          echo "case3 (docker-entrypoint-initdb.d):       $CASE3"
+          echo "case4 (persistence across recreation):    $CASE4"
+          echo "case5 (contrib extension, pg_trgm):       $CASE5"
+          fail=0
+          for v in "$CASE1" "$CASE2" "$CASE3" "$CASE4" "$CASE5"; do
+            [ "$v" = "success" ] || fail=1
+          done
+          exit "$fail"

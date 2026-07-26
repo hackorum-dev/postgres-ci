@@ -1,0 +1,57 @@
+# Build environments for hackorum patch CI, keyed by the PG major version of
+# the base commit. One image per family; every major it serves is a tag on it.
+#
+# reference_commits warm the baked ccache - one build per major the family
+# serves, all sharing one content-addressed cache.
+#
+# runtime_packages lists the shared-library packages a compiled postgres
+# needs at runtime for that family's Debian release. Runtime library package
+# names change across releases (openssl, ldap and readline all rename
+# theirs), so this is spelled out per family instead of guessed once.
+families:
+  stretch:
+    enabled: true
+    base_image: debian/eol:stretch
+    eol: true
+    majors:
+      9:  bd6cf3f237c9aeb4dad1ac3ec2008c5768fe4c1b
+      10: 8569955ee39650a667b9700385e1bc19fbf47069
+      11: 96102a32a374c3b81ba9c2b24bcf1943a87a9ef6
+    runtime_packages: >-
+      libssl1.1 libreadline7 libicu57 libldap-2.4-2 libxml2 libxslt1.1
+      libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.24
+  buster:
+    enabled: false
+    base_image: debian:buster
+    eol: true
+    majors:
+      12: null
+      13: null
+  bullseye:
+    enabled: true
+    base_image: debian:bullseye
+    eol: false
+    majors:
+      14: 88e014c149cc396fb218b08eda17c47d5b33e94f
+      15: cab5b9ab2c066ba904f13de2681872dcda31e207
+    runtime_packages: >-
+      libssl1.1 libreadline8 libicu67 libldap-2.4-2 libxml2 libxslt1.1
+      libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.32
+  bookworm:
+    enabled: false
+    base_image: debian:bookworm
+    eol: false
+    majors:
+      16: null
+      17: null
+  trixie:
+    enabled: true
+    base_image: debian:trixie
+    eol: false
+    majors:
+      18: c9b3d4909bbfcaa8cc2ed434d12a562fb30fe422
+      19: 45d92b76dc4ac31d44e46ca38bee12d5d8fac1f5
+      20: 1c4b1de888559a47df599dcef356ea7fbf96fd0c
+    runtime_packages: >-
+      libssl3t64 libreadline8t64 libicu76 libldap2 libxml2 libxslt1.1
+      libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.40

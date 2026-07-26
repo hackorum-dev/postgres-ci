@@ -1,0 +1,519 @@
+name: hackorum patch CI
+
+# Reusable workflow called by the ~15-line stub workflow that lives on every
+# patch branch in hackorum-dev/postgres. One patch branch = one call, with
+# the four facts identifying it passed in as inputs.
+on:
+  workflow_call:
+    inputs:
+      pg_major:
+        required: true
+        type: number
+      topic_id:
+        required: true
+        type: number
+      message_index:
+        required: true
+        type: number
+      base_sha:
+        required: true
+        type: string
+
+concurrency:
+  group: hackorum-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Builds and tests the patch. This is the only job that runs code from
+  # the patch itself - mailing-list patches are untrusted input, so this
+  # job carries read-only permissions and never sees a token that can push
+  # or publish anything. Everything that needs write access happens later,
+  # in jobs that only ever look at this job's build output, not its source.
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      build_ok: ${{ steps.build.outputs.ok }}
+      tests_ok: ${{ steps.test.outputs.ok || 'false' }}
+      status: ${{ steps.collect.outputs.status }}
+    steps:
+      - name: Check out patch branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Pulled in after the main checkout, since actions/checkout clears the
+      # workspace first. Only the result parser lives here, not baked into
+      # the era image - so a parser fix ships immediately, without a
+      # 30-minute image rebuild.
+      - name: Check out CI scripts
+        uses: actions/checkout@v4
+        with:
+          repository: hackorum-dev/postgres-ci
+          path: .ci
+          persist-credentials: false
+
+      # The era image is only ever entered via "docker exec" below, never as
+      # this job's own `container:` - GitHub injects its own Node.js into a
+      # job container to run actions like checkout/upload-artifact, and that
+      # Node build needs a newer glibc than the old eras (stretch) ship.
+      # Keeping every action on the runner's own host sidesteps that
+      # entirely; the era's old userland is used for compiling and testing
+      # postgres only, which is all it was ever needed for.
+      #
+      # Mounted at /tmp/pg, not somewhere under $GITHUB_WORKSPACE's own
+      # path - this is also where the image's own build (baking its warm
+      # ccache) compiled the same reference commit, and ccache's default
+      # hash_dir setting bakes the compilation directory into the cache
+      # key. Matching it is what makes the baked cache actually hit.
+      #
+      # --init: without it, "tail -f /dev/null" is PID 1 and never reaps
+      # children. Recovery/crash tests SIGKILL a postmaster and expect to
+      # immediately start a fresh one in its place; the killed one becomes
+      # a zombie with no reaper, its PID stays live in the process table,
+      # and postgres's own already-running check refuses the new instance
+      # because it still sees that PID. --init gives PID 1 a real (tini)
+      # reaper so killed children actually go away.
+      - name: Start era container
+        run: |
+          docker run -d --name pgci --user root --init \
+            -v "$GITHUB_WORKSPACE:/tmp/pg" -w /tmp/pg \
+            "ghcr.io/hackorum-dev/pg-build-env:pg${{ inputs.pg_major }}" \
+            tail -f /dev/null
+          docker exec pgci chown -R ci:ci /tmp/pg /ccache
+
+      # configure.ac pins an exact autoconf version and refuses to run under
+      # anything else, so configure only gets regenerated when the patch
+      # actually touched the files autoconf reads.
+      - name: Regenerate configure if the patch touched it
+        run: |
+          git diff --quiet ${{ inputs.base_sha }} HEAD -- configure.ac configure.in || \
+            docker exec pgci as-ci autoconf -f
+
+      - name: Configure
+        run: |
+          set -e
+          flags="--enable-debug --enable-cassert --enable-tap-tests --prefix=/tmp/pgi"
+          if [ "${{ inputs.pg_major }}" -ge 17 ]; then
+            flags="$flags --enable-injection-points"
+          fi
+          docker exec pgci as-ci ./configure $flags
+
+      # world-bin/install-world-bin only exist from PG15 onward; older
+      # trees need the core build plus a separate contrib build/install.
+      # The whole thing shares one 25-minute budget - timeout(1) exits 124
+      # on expiry, which is what distinguishes "ran out of our CI time" from
+      # "the patch's build actually failed" below. -k 30s: timeout only
+      # signals its direct child, so a stuck make -j tree could otherwise
+      # outlive the deadline; SIGKILL 30s later bounds that.
+      #
+      # shell: bash is explicit, not just the default, because $SECONDS is
+      # a bash-only feature - this step silently timed our build at a flat
+      # zero seconds once already, on a shell that doesn't have it.
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          set +e
+          start=$SECONDS
+          if [ "${{ inputs.pg_major }}" -ge 15 ]; then
+            timeout -k 30s 25m docker exec pgci bash -c '
+              set -e
+              as-ci make -j"$(nproc)" -s world-bin
+              as-ci make -j"$(nproc)" -s install-world-bin
+            '
+          else
+            timeout -k 30s 25m docker exec pgci bash -c '
+              set -e
+              as-ci make -j"$(nproc)" -s
+              as-ci make -j"$(nproc)" -s -C contrib
+              as-ci make -j"$(nproc)" -s install
+              as-ci make -j"$(nproc)" -s -C contrib install
+            '
+          fi
+          rc=$?
+          seconds=$((SECONDS - start))
+          echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 0 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "timeout=false" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 124 ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "timeout=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "timeout=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      # Runs inside the container, writing into the same bind mount, so the
+      # tarball lands in $GITHUB_WORKSPACE on the host without needing the
+      # container to stay alive for the upload step below.
+      - name: Package install tree
+        if: steps.build.outputs.ok == 'true'
+        run: docker exec pgci tar -C /tmp/pgi -czf /tmp/pg/pg-install.tar.gz .
+
+      - name: Upload install tree
+        if: steps.build.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-install
+          path: pg-install.tar.gz
+          retention-days: 7
+
+      # PG_TEST_TIMEOUT_DEFAULT is deliberately left at its default - a
+      # short inner per-test timeout looks appealing for catching hangs
+      # fast, but under -j contention tests legitimately run slower, and a
+      # short inner timeout just turns CI load into flaky patch failures.
+      # The outer timeout below is the real hang protection, and its 124
+      # gets a distinct status from an ordinary test failure - one is our
+      # CI running out of budget, the other is the patch.
+      - name: Test
+        id: test
+        if: steps.build.outputs.ok == 'true'
+        shell: bash
+        run: |
+          set +e
+          start=$SECONDS
+          timeout -k 30s 20m docker exec pgci bash -c '
+            PG_TEST_EXTRA= as-ci make -s check-world -Otarget -j"$(nproc)" PROVE_FLAGS=--timer PGCTLTIMEOUT=120 2>&1 | tee check-world.log
+            exit ${PIPESTATUS[0]}
+          '
+          rc=$?
+          seconds=$((SECONDS - start))
+          echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 0 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "timeout=false" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 124 ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "timeout=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "timeout=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      # Same runner.temp reasoning as "Collect results" below - the
+      # redirect below is a host-side file create, and the checkout root
+      # it would otherwise land in belongs to "ci" by this point. Caught
+      # here by chance only because "|| true" swallows the write failure
+      # too, not just docker exec's - so this looked green while quietly
+      # writing nothing, until the same problem crashed loudly downstream.
+      - name: ccache stats
+        if: always()
+        run: docker exec pgci as-ci ccache -s > "${{ runner.temp }}/ccache-stats.txt" || true
+
+      # Puts the failing test's own log straight in the run log, so nobody
+      # has to download an artifact to see why a branch failed. Runs as
+      # root inside the container for the same reason as the diffs step
+      # below - the test's own tmp_check dirs are mode 0700, owned by ci.
+      # Bounded to 300 lines per file so one noisy test can't flood the log.
+      # Also emits a plain suite/testname list on its last line - some old
+      # PG majors' prove output never names the failing file at all (no
+      # per-file summary line on a bailout before any subtest ran), so the
+      # log text alone can't be parsed for it; walking the log directory
+      # can.
+      - name: Print logs for failed tests
+        if: always() && steps.build.outputs.ok == 'true' && steps.test.outputs.ok != 'true'
+        run: |
+          docker exec pgci bash -c '
+            cd /tmp/pg
+            shopt -s globstar nullglob
+            names=""
+            for f in **/tmp_check/log/regress_log_*; do
+              grep -qE "not ok|Bail out" "$f" || continue
+              suite=$(basename "$(dirname "$(dirname "$(dirname "$f")")")")
+              stem=${f##*regress_log_}
+              names="$names $suite/$stem"
+              echo "===== $f ====="
+              tail -n 300 "$f"
+              echo
+              dir=$(dirname "$f")
+              for nl in "$dir/${stem}"_*.log; do
+                [ -f "$nl" ] || continue
+                echo "----- $nl -----"
+                tail -n 300 "$nl"
+                echo
+              done
+            done
+            for f in **/regression.diffs; do
+              echo "===== $f ====="
+              tail -n 300 "$f"
+              echo
+            done
+            echo "HACKORUM_FAILED_TESTS:$names"
+          ' > "${{ runner.temp }}/failed-test-logs.txt"
+          cat "${{ runner.temp }}/failed-test-logs.txt"
+          grep "^HACKORUM_FAILED_TESTS:" "${{ runner.temp }}/failed-test-logs.txt" \
+            | sed 's/^HACKORUM_FAILED_TESTS://' \
+            > "${{ runner.temp }}/bailout-tests.txt" || true
+
+      # Test data directories (pg_regress/initdb tmp_check dirs) come out
+      # mode 0700 owned by ci, which the host runner user can't even list,
+      # let alone read - so this has to run as root, inside the container,
+      # while it's still alive, and hand the host a single plain file
+      # instead of leaving it to walk the tree itself. Only present when
+      # the test run actually got as far as executing pg_regress and
+      # something didn't match - a build failure or a timeout leaves
+      # nothing here, which is fine.
+      - name: Collect regression diffs
+        if: always() && steps.build.outputs.ok == 'true' && steps.test.outputs.ok != 'true'
+        run: |
+          docker exec pgci bash -c '
+            cd /tmp/pg
+            files=$(find . -name regression.diffs)
+            if [ -n "$files" ]; then
+              tar -czf /tmp/pg/.ci-regression-diffs.tar.gz $files
+            fi
+          '
+
+      # Force-removes the container regardless of whether the build/test
+      # timeouts above actually reached it - "docker exec" doesn't reliably
+      # proxy a kill signal all the way to the compiled process tree inside,
+      # so this is the one thing that's sure to end it.
+      - name: Stop era container
+        if: always()
+        run: docker rm -f pgci >/dev/null 2>&1 || true
+
+      # Written to runner.temp, not the checkout - the checkout root now
+      # belongs to the container's "ci" user (the chown a few steps back
+      # applies to the host side too, since it's a bind mount), and the
+      # runner's own user can't create a file in a directory it doesn't
+      # own. A CI report doesn't belong inside the patch's tree anyway.
+      - name: Collect results
+        id: collect
+        if: always()
+        run: |
+          python3 .ci/scripts/collect_results.py \
+            --branch "${{ github.ref_name }}" \
+            --head-sha "${{ github.sha }}" \
+            --base-sha "${{ inputs.base_sha }}" \
+            --pg-major "${{ inputs.pg_major }}" \
+            --build-ok "${{ steps.build.outputs.ok || 'false' }}" \
+            --build-seconds "${{ steps.build.outputs.seconds || '0' }}" \
+            --build-timeout "${{ steps.build.outputs.timeout || 'false' }}" \
+            --tests-ok "${{ steps.test.outputs.ok || 'false' }}" \
+            --tests-seconds "${{ steps.test.outputs.seconds || '0' }}" \
+            --tests-timeout "${{ steps.test.outputs.timeout || 'false' }}" \
+            --check-world-log check-world.log \
+            --extra-failed "${{ runner.temp }}/bailout-tests.txt" \
+            --ccache-log "${{ runner.temp }}/ccache-stats.txt" \
+            --out "${{ runner.temp }}/result.json"
+          echo "status=$(python3 -c 'import json; print(json.load(open("${{ runner.temp }}/result.json"))["status"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CI result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result
+          path: ${{ runner.temp }}/result.json
+          retention-days: 90
+
+      # A tarball, not the raw files - see "Collect regression diffs"
+      # above for why the host can't just glob these itself.
+      - name: Upload regression diffs
+        if: always() && steps.build.outputs.ok == 'true' && steps.test.outputs.ok != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-diffs
+          path: .ci-regression-diffs.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Turns the install tree into a runnable image. Deliberately split from
+  # the job above: publishing needs a write token, and the build/test job
+  # runs untrusted patch code, so the two never share a job. This job only
+  # ever touches the tarball the previous job produced, never the source
+  # tree itself.
+  publish:
+    needs: build-and-test
+    if: ${{ !cancelled() && needs.build-and-test.outputs.build_ok == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      image_ref: ghcr.io/${{ github.repository_owner }}/postgres-patch:t${{ inputs.topic_id }}
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Download install tree
+        uses: actions/download-artifact@v4
+        with:
+          name: pg-install
+          path: .
+
+      - name: Unpack install tree
+        run: |
+          mkdir -p ctx/pgsql
+          tar -xzf pg-install.tar.gz -C ctx/pgsql
+
+      - name: Write patch metadata
+        run: |
+          cat > ctx/hackorum-patch.json <<'JSON'
+          {
+            "topic_id": ${{ inputs.topic_id }},
+            "message_index": ${{ inputs.message_index }},
+            "branch": "${{ github.ref_name }}",
+            "base_sha": "${{ inputs.base_sha }}",
+            "head_sha": "${{ github.sha }}",
+            "pg_major": ${{ inputs.pg_major }},
+            "run_id": ${{ github.run_id }},
+            "note": "cassert/debug build for trying this patch - not built or configured for benchmarking"
+          }
+          JSON
+
+      # The runtime image sets no PATH/LD_LIBRARY_PATH of its own beyond the
+      # base distro default, which doesn't include /usr/local/pgsql - so
+      # both get added here rather than assumed.
+      - name: Write Dockerfile
+        run: |
+          cat > ctx/Dockerfile <<DOCKERFILE
+          FROM ghcr.io/hackorum-dev/pg-build-env:pg${{ inputs.pg_major }}-runtime
+          COPY pgsql /usr/local/pgsql
+          COPY hackorum-patch.json /hackorum-patch.json
+          ENV PATH="/usr/local/pgsql/bin:\${PATH}"
+          ENV LD_LIBRARY_PATH="/usr/local/pgsql/lib"
+          # initdb's stock template only listens on localhost. our vendored
+          # entrypoint (unlike upstream's own Dockerfile) never overrides
+          # this for the real server, only for its own throwaway
+          # init-scripts instance - so without this, "docker run -p
+          # 5432:5432" can never reach the server at all, on any major.
+          # the grep after the sed makes a future postgresql.conf.sample
+          # layout change fail the image build instead of silently
+          # reintroducing the same breakage.
+          RUN set -eux; sed -ri "s!^#?(listen_addresses)\s*=\s*\S+.*!\1 = '*'!" /usr/local/pgsql/share/postgresql/postgresql.conf.sample; grep -qxF "listen_addresses = '*'" /usr/local/pgsql/share/postgresql/postgresql.conf.sample
+          LABEL org.opencontainers.image.source="https://github.com/${{ github.repository }}"
+          LABEL org.opencontainers.image.revision="${{ github.sha }}"
+          LABEL org.opencontainers.image.description="hackorum patch CI build, topic ${{ inputs.topic_id }}, pg${{ inputs.pg_major }}, cassert debug build, not for benchmarking"
+          LABEL dev.hackorum.topic-id="${{ inputs.topic_id }}"
+          LABEL dev.hackorum.message-index="${{ inputs.message_index }}"
+          LABEL dev.hackorum.base-sha="${{ inputs.base_sha }}"
+          LABEL dev.hackorum.pg-major="${{ inputs.pg_major }}"
+          DOCKERFILE
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push patch image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/postgres-patch:t${{ inputs.topic_id }}
+
+      # Proves the published image actually runs, not just that it built -
+      # entrypoint, initdb, gosu, install-tree layout and PATH all have to
+      # line up for a server to come up at all.
+      - name: Smoke test the published image
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository_owner }}/postgres-patch:t${{ inputs.topic_id }}
+        run: |
+          docker run -d --name smoke -e POSTGRES_PASSWORD=smoke "$IMAGE_REF"
+          for i in $(seq 1 60); do
+            if docker exec smoke pg_isready -U postgres >/dev/null 2>&1; then
+              echo "server accepted connections after ${i}s"
+              docker exec smoke psql -U postgres -c 'select version()'
+              docker rm -f smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not accept connections within 60s"
+          docker logs smoke
+          docker rm -f smoke
+          exit 1
+
+  # Records the outcome as a git ref in the caller repo - no write token
+  # ever touches the source tree, and no 1.5GB fork clone happens just to
+  # carry a 2KB status file.
+  report:
+    needs: [build-and-test, publish]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download CI result
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-result
+          path: ci-result
+
+      # A completed run with no result.json at all (checkout failed,
+      # container image failed to pull, ...) still gets an explicit
+      # infra_error payload - the consumer treats a run with no payload as
+      # an anomaly, and a status beats silence.
+      - name: Build report payload
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          BRANCH: ${{ github.ref_name }}
+          PG_MAJOR: ${{ inputs.pg_major }}
+          IMAGE_REF: ${{ needs.publish.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.image_digest }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          path = "ci-result/result.json"
+          if os.path.exists(path):
+              with open(path) as f:
+                  payload = json.load(f)
+          else:
+              payload = {
+                  "schema": 1,
+                  "status": "infra_error",
+                  "build": {"ok": False, "seconds": 0},
+                  "tests": {"ok": False, "seconds": 0, "timed_out": False, "failed": []},
+                  "ccache": {"hit": 0, "miss": 0},
+              }
+
+          # run-level facts are always known from the workflow context,
+          # regardless of whether the build-and-test job produced anything.
+          payload["run_id"] = int(os.environ["RUN_ID"])
+          payload["run_attempt"] = int(os.environ["RUN_ATTEMPT"])
+          payload["head_sha"] = os.environ["HEAD_SHA"]
+          payload["base_sha"] = os.environ["BASE_SHA"]
+          payload["branch"] = os.environ["BRANCH"]
+          payload["pg_major"] = int(os.environ["PG_MAJOR"])
+
+          image_ref = os.environ.get("IMAGE_REF") or None
+          image_digest = os.environ.get("IMAGE_DIGEST") or None
+          payload["image"] = {"ref": image_ref, "digest": image_digest} if image_ref else None
+
+          with open("payload.json", "w") as f:
+              json.dump(payload, f, indent=2)
+              f.write("\n")
+          PY
+
+      - name: Push report ref
+        run: |
+          set -eu
+          rm -rf report-repo
+          mkdir report-repo
+          cp payload.json report-repo/result.json
+          cd report-repo
+          git init -q
+          git config user.email "hackorum-ci@users.noreply.github.com"
+          git config user.name "hackorum-ci"
+          git add result.json
+          GIT_AUTHOR_DATE="2000-01-01T00:00:00Z" GIT_COMMITTER_DATE="2000-01-01T00:00:00Z" \
+            git commit -q -m "ci result for run ${{ github.run_id }}"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git push -q --force origin "HEAD:refs/hackorum-ci/${{ github.ref_name }}/${{ github.run_id }}"

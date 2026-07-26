@@ -1,0 +1,128 @@
+name: Build era images
+
+on:
+  # A build is requested by putting a marker on the subject line of the
+  # triggering commit: [build <family>], or [build all] for every enabled
+  # family. A push with no marker runs the matrix job but builds nothing.
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      family:
+        description: "Single family to build (empty = all enabled)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      families: ${{ steps.pick.outputs.families }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        env:
+          FAMILY_INPUT: ${{ inputs.family }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys, subprocess
+          subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyyaml"], check=True)
+          import yaml
+          cfg = yaml.safe_load(open("eras.yml"))
+          want = os.environ.get("FAMILY_INPUT", "").strip()
+          if not want:
+              msg = os.environ.get("HEAD_COMMIT_MESSAGE", "")
+              # only the subject line counts - a squashed commit's body is
+              # built out of every commit message it absorbs, so a marker
+              # left over in an old commit must not resurrect itself there
+              subject = msg.splitlines()[0] if msg else ""
+              m = re.search(r"\[build ([a-z0-9]+)\]", subject)
+              if m is None:
+                  print("families=[]")
+                  raise SystemExit(0)
+              if m.group(1) != "all":
+                  want = m.group(1)
+          out = []
+          for name, f in cfg["families"].items():
+              if want and name != want:
+                  continue
+              if not want and not f.get("enabled"):
+                  continue
+              refs = [s for s in f["majors"].values() if s]
+              out.append({
+                  "name": name,
+                  "base_image": f["base_image"],
+                  "eol": str(bool(f.get("eol"))).lower(),
+                  "majors": sorted(f["majors"].keys()),
+                  "reference_commits": " ".join(refs),
+                  "extra_packages": f.get("extra_packages", ""),
+                  "runtime_packages": f.get("runtime_packages", ""),
+              })
+          print("families=" + json.dumps(out))
+          PY
+
+  build:
+    needs: matrix
+    if: ${{ needs.matrix.outputs.families != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        family: ${{ fromJSON(needs.matrix.outputs.families) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose tags
+        id: tags
+        run: |
+          tags=""
+          for m in ${{ join(matrix.family.majors, ' ') }}; do
+            tags="$tags,ghcr.io/${{ github.repository_owner }}/pg-build-env:pg${m}"
+          done
+          echo "list=${tags#,}" >> "$GITHUB_OUTPUT"
+
+      - name: Compose runtime tags
+        id: runtime-tags
+        run: |
+          tags=""
+          for m in ${{ join(matrix.family.majors, ' ') }}; do
+            tags="$tags,ghcr.io/${{ github.repository_owner }}/pg-build-env:pg${m}-runtime"
+          done
+          echo "list=${tags#,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/build-env.Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            BASE_IMAGE=${{ matrix.family.base_image }}
+            EOL=${{ matrix.family.eol }}
+            EXTRA_PACKAGES=${{ matrix.family.extra_packages }}
+            REFERENCE_COMMITS=${{ matrix.family.reference_commits }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/runtime.Dockerfile
+          push: true
+          tags: ${{ steps.runtime-tags.outputs.list }}
+          build-args: |
+            BASE_IMAGE=${{ matrix.family.base_image }}
+            EOL=${{ matrix.family.eol }}
+            RUNTIME_PACKAGES=${{ matrix.family.runtime_packages }}
