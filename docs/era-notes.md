@@ -213,6 +213,48 @@ Neither family needs `extra_packages` - every package
 `build-env.Dockerfile` installs, plus `gosu` for the runtime image, exists in
 both releases.
 
+### Both families green first try
+
+No iteration rounds. Every name in both `runtime_packages` lists installed on
+the first build - `Setting up` lines in the logs confirm `libssl1.1`,
+`libreadline7`, `libicu63`, `libldap-2.4-2`, `libperl5.28` on buster and
+`libssl3`, `libreadline8`, `libicu72`, `libldap-2.5-0`, `libperl5.36` on
+bookworm, with no `Unable to locate package` anywhere in either log.
+
+| family | run | majors | duration | per major |
+|---|---|---|---|---|
+| buster | 30306270062 | 12, 13 | 11.7 min | ~5.9 min |
+| bookworm | 30306276824 | 16, 17 | 13.4 min | ~6.7 min |
+
+Both reference commits per family were fetched and built - two distinct
+`git fetch --depth 1 origin <sha>` lines per log, two `autoconf -f` /
+`./configure` / `check-world` passes, `autoconf (GNU Autoconf) 2.69` on both
+bases. `check-world` came back `Result: PASS` throughout (42 suite results on
+buster, 79 on bookworm) with no `Bail out`, no `not ok`, no
+`regression.diffs`.
+
+Slots into the existing cost-versus-tree-age trend rather than breaking it:
+bullseye ~5.8 min/major, buster ~5.9, bookworm ~6.7, trixie ~8.8. Old trees
+stay cheaper, as the stretch numbers first showed.
+
+`ccache -s` after the warm-up, worth noting only because the two families
+report it differently: buster's ccache is 3.x and prints the old format
+(hit rate 2.47%, 5294 files in cache), bookworm's is 4.x and prints
+`Cacheable calls: 3049 / 3829 (79.63%)`. Low hit rate on the image build
+itself is expected - it is warming the cache, not hitting it. What matters is
+that the cache is populated, and both are.
+
+Published sizes, in line with the other families (one image per family, each
+major a tag on it - `pg12`/`pg13` share a digest, as do `pg16`/`pg17`):
+
+| tag | size | runtime tag | size |
+|---|---|---|---|
+| pg12, pg13 | 325 MB | pg12-runtime, pg13-runtime | 86 MB |
+| pg16, pg17 | 372 MB | pg16-runtime, pg17-runtime | 87 MB |
+
+All eight tags pull anonymously over the GHCR API, checked by manifest
+request rather than assumed from a green build.
+
 ### Built while still disabled, on purpose
 
 `enabled: true` and the app's `supported?` were held back until the tags were

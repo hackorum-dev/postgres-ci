@@ -21,7 +21,7 @@ families:
       libssl1.1 libreadline7 libicu57 libldap-2.4-2 libxml2 libxslt1.1
       libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.24
   buster:
-    enabled: false
+    enabled: true
     base_image: debian/eol:buster
     eol: true
     majors:
@@ -41,7 +41,7 @@ families:
       libssl1.1 libreadline8 libicu67 libldap-2.4-2 libxml2 libxslt1.1
       libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.32
   bookworm:
-    enabled: false
+    enabled: true
     base_image: debian:bookworm
     eol: false
     majors:
