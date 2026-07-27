@@ -130,6 +130,104 @@ Three iterations to green; each failure was a real finding, not noise.
    warm-up loop (see the autoconf section above) - stretch 17.0 min for
    three majors, no regression.
 
+## buster (pg12, pg13) and bookworm (pg16, pg17)
+
+The two families that shipped as `enabled: false` stubs - `majors` listed but
+no reference commits and no `runtime_packages`. Together they cover 1254 of
+the 4830 current patch branches carrying a base commit (26%), every one of
+which sat in won't-retry with `no era image for pgNN` until these landed.
+
+### `debian:buster` could never have worked - buster is archive-only
+
+The stub had `base_image: debian:buster`. Checked both mirrors directly:
+
+```
+https://deb.debian.org/debian/dists/buster/Release      404
+https://archive.debian.org/debian/dists/buster/Release  200
+```
+
+Buster left the live mirrors, so `apt-get update` on the official
+`debian:buster` image 404s on every index before installing anything. Changed
+to `debian/eol:buster` (that tag does exist - checked Docker Hub's tag list
+for `debian/eol`), which points its sources at archive.debian.org, same as
+stretch already did. `eol: true` was already set on the stub, so
+`build-env.Dockerfile`'s `Acquire::Check-Valid-Until "false"` path handles
+the long-expired Release file with no further change.
+
+bookworm needs none of this - it still resolves on deb.debian.org (200), so
+`debian:bookworm` / `eol: false` was already right.
+
+### Reference commits: the corpus's own median base, not a window midpoint
+
+The existing eight sit near the midpoint of each major's devel window
+(`Stamp HEAD as Ndevel` to the next one). These four are instead the
+branch-weighted median base commit of the corpus for that major - the point
+half the branches sit before and half after:
+
+| major | commit | date | branches |
+|---|---|---|---|
+| 12 | 68a13f28bebc9eb70cc6988bfa2daaf4500f519f | 2019-01-02 | 328 |
+| 13 | 7559d8ebfa11d98728e816f6b655582ce41150f3 | 2020-01-01 | 344 |
+| 16 | c8e1ba736b2b9e8c98d37a5b77c4ed31baf94147 | 2023-01-02 | 299 |
+| 17 | 29275b1d177096597675b5c6e7e7c9db2df8f4df | 2024-01-03 | 283 |
+
+These land 3-12 days from where the window-midpoint rule would have put them,
+so the two rules agree to within noise here - the corpus is spread fairly
+evenly across each devel cycle. Using the median anyway costs nothing and
+guarantees the warm-up compiles a tree real patchsets actually sit on, rather
+than one no branch uses.
+
+Each was verified before use: on `master`, `AC_INIT` reporting the expected
+`Ndevel`, and resolving on `hackorum-dev/postgres` so the Dockerfile's
+`git fetch --depth 1 origin <sha>` can find it. Note 12 and 13 carry
+`configure.in`, not `configure.ac` - the rename lands in 14. `EraDetector`
+reads both, and `autoconf -f` in the warm-up loop takes either.
+
+### runtime_packages: bookworm's ldap is a third distinct name
+
+Same method as the first three families - every name checked against that
+release's real `Packages.gz` (archive.debian.org for buster,
+deb.debian.org for bookworm), plus each `-dev` package's `Depends:` field, so
+the runtime list matches what `build-env.Dockerfile` actually links against
+instead of matching a version number by eye.
+
+| library  | buster        | bookworm       |
+|----------|---------------|----------------|
+| openssl  | libssl1.1     | libssl3        |
+| readline | libreadline7  | libreadline8   |
+| icu      | libicu63      | libicu72       |
+| ldap     | libldap-2.4-2 | libldap-2.5-0  |
+| perl     | libperl5.28   | libperl5.36    |
+
+The earlier note guessed ahead for these two families and got half of it
+right. It predicted bookworm would not need trixie's `t64` suffix - correct,
+`libssl3` and `libreadline8` are the real names. It said nothing about ldap,
+which is the one that would have been guessed wrong: bookworm ships OpenLDAP
+2.5 as `libldap-2.5-0`, a third name distinct from both stretch/bullseye's
+`libldap-2.4-2` and trixie's `libldap2`. It does not resolve directly either -
+`libldap2-dev` depends on `libldap-dev`, which depends on `libldap-2.5-0`, so
+it takes two hops to reach. Four names for one library across five families;
+there is no rule here, only the archive.
+
+Neither family needs `extra_packages` - every package
+`build-env.Dockerfile` installs, plus `gosu` for the runtime image, exists in
+both releases.
+
+### Built while still disabled, on purpose
+
+`enabled: true` and the app's `supported?` were held back until the tags were
+confirmed pullable. `PushGuard` computes the major from `base_sha` live rather
+than from `patch_branches.pg_major` (which is entirely NULL - that backfill
+still hasn't run), so the flip makes all 1254 branches push-eligible
+immediately. Flipping before the images exist would have failed every one of
+them on `docker pull` and stamped `infra_error` across a quarter of the
+corpus.
+
+`build-era-images.yml`'s matrix job allows exactly this: the `enabled` check
+only applies when no family was named, so a `[build <family>]` marker or a
+`workflow_dispatch` naming one family builds a disabled family, while
+`[build all]` still skips it. Build first, flip second.
+
 ## All eight tags, final green run (30199806638, reconfirmed in 30200702902)
 
 pg9, pg10, pg11 (stretch), pg14, pg15 (bullseye), pg18, pg19, pg20 (trixie).

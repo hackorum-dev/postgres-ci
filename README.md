@@ -10,8 +10,12 @@ history. One image per Debian era, tagged per PG major it serves.
 | pg9  | pg9-runtime   | debian/eol:stretch |
 | pg10 | pg10-runtime  | debian/eol:stretch |
 | pg11 | pg11-runtime  | debian/eol:stretch |
+| pg12 | pg12-runtime  | debian/eol:buster  |
+| pg13 | pg13-runtime  | debian/eol:buster  |
 | pg14 | pg14-runtime  | debian:bullseye    |
 | pg15 | pg15-runtime  | debian:bullseye    |
+| pg16 | pg16-runtime  | debian:bookworm    |
+| pg17 | pg17-runtime  | debian:bookworm    |
 | pg18 | pg18-runtime  | debian:trixie      |
 | pg19 | pg19-runtime  | debian:trixie      |
 | pg20 | pg20-runtime  | debian:trixie      |

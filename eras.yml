@@ -22,11 +22,14 @@ families:
       libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.24
   buster:
     enabled: false
-    base_image: debian:buster
+    base_image: debian/eol:buster
     eol: true
     majors:
-      12: null
-      13: null
+      12: 68a13f28bebc9eb70cc6988bfa2daaf4500f519f
+      13: 7559d8ebfa11d98728e816f6b655582ce41150f3
+    runtime_packages: >-
+      libssl1.1 libreadline7 libicu63 libldap-2.4-2 libxml2 libxslt1.1
+      libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.28
   bullseye:
     enabled: true
     base_image: debian:bullseye
@@ -42,8 +45,11 @@ families:
     base_image: debian:bookworm
     eol: false
     majors:
-      16: null
-      17: null
+      16: c8e1ba736b2b9e8c98d37a5b77c4ed31baf94147
+      17: 29275b1d177096597675b5c6e7e7c9db2df8f4df
+    runtime_packages: >-
+      libssl3 libreadline8 libicu72 libldap-2.5-0 libxml2 libxslt1.1
+      libpam0g libkrb5-3 libselinux1 libuuid1 zlib1g libperl5.36
   trixie:
     enabled: true
     base_image: debian:trixie
