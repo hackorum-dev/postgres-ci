@@ -554,20 +554,30 @@ log output (the `Summarize` step prints all five), not the jobs API.
 ### Readiness check: poll the host port, not `docker exec ... pg_isready`
 
 First cut of the wait loop ran `docker exec <container> pg_isready` in a
-retry loop, same as the existing smoke test. That works for the smoke
-test because the smoke test only ever talks to the container over
-`docker exec` too - but this workflow's whole point is testing the
-published host port, and `docker exec pg_isready` connects over the
-container's local socket, which comes up *before* the real thing. The
-vendored entrypoint starts a throwaway, local-socket-only postgres first
-(to run init scripts), stops it, then starts the real, TCP-listening one.
-A `docker exec` check happily reports the throwaway instance ready, and a
-host connection made right after catches the gap between the two servers:
-`psql: error: ... server closed the connection unexpectedly` (run
-30210039720, every one of the 45 case-attempts, same failure). Fixed by
-polling `pg_isready -h 127.0.0.1 -p <port>` from the runner itself
-(`scripts/wait_pg_ready.sh`) - that only succeeds once the real server is
-listening the same way an actual caller would reach it.
+retry loop, same as the existing smoke test. `docker exec pg_isready`
+connects over the container's local socket, which comes up *before* the
+real thing. The vendored entrypoint starts a throwaway, local-socket-only
+postgres first (to run init scripts), stops it, then starts the real,
+TCP-listening one. A `docker exec` check happily reports the throwaway
+instance ready, and a host connection made right after catches the gap
+between the two servers: `psql: error: ... server closed the connection
+unexpectedly` (run 30210039720, every one of the 45 case-attempts, same
+failure). Fixed by polling `pg_isready -h 127.0.0.1 -p <port>` from the
+runner itself (`scripts/wait_pg_ready.sh`) - that only succeeds once the
+real server is listening the same way an actual caller would reach it.
+
+This section originally claimed the patch CI smoke test was safe from
+this because it only ever talks to the container over `docker exec`. It
+was not. Staying inside the container narrows the gap to the few
+milliseconds between the `pg_isready` exec and the `psql` exec, but does
+not close it: of 92 failed patch CI runs on 2026-07-27, 72 were healthy
+images where the probe passed against the throwaway server and the query
+landed after it stopped - `FATAL: the database system is shutting down`
+or a socket that was already gone. Successful runs printed the same
+"accepted connections after 2s" line, so every run was racing and ~96%
+of them won. The smoke test now uses `wait_pg_ready.sh` and a published
+port like the contract cases do. There is one readiness rule; nothing
+gets to have its own.
 
 ### Real defect found: images could never accept a host connection at all
 

@@ -367,6 +367,16 @@ jobs:
       image_ref: ghcr.io/${{ github.repository_owner }}/postgres-patch:t${{ inputs.topic_id }}
       image_digest: ${{ steps.push.outputs.digest }}
     steps:
+      # First, not next to the step that uses it: checkout cleans before it
+      # writes, and by then the workspace holds the unpacked build context.
+      # Only the wait helper is wanted - this job never checks out the patch.
+      - name: Check out CI scripts
+        uses: actions/checkout@v4
+        with:
+          repository: hackorum-dev/postgres-ci
+          path: .ci
+          persist-credentials: false
+
       - name: Download install tree
         uses: actions/download-artifact@v4
         with:
@@ -443,27 +453,44 @@ jobs:
           labels: |
             org.opencontainers.image.description=${{ needs.build-and-test.outputs.image_description }}
 
+      # ubuntu-latest usually ships one already, but the smoke test below
+      # depends on it, so check rather than assume.
+      - name: Ensure a psql client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          psql --version
+
       # Proves the published image actually runs, not just that it built -
       # entrypoint, initdb, gosu, install-tree layout and PATH all have to
       # line up for a server to come up at all.
+      #
+      # Run and connected the same way the image's own contract test does,
+      # through a published port from the host, via the shared wait helper.
+      # An earlier version waited with "docker exec ... pg_isready" and then
+      # queried over the container's local socket, which cannot tell the real
+      # server from the throwaway, socket-only one the entrypoint runs initdb
+      # setup against - see scripts/wait_pg_ready.sh. It reported ready
+      # against the throwaway instance and the query a moment later landed in
+      # the gap, failing ~4% of publishes on healthy images. The host port
+      # only ever reaches the real server, and reaching it that way is also
+      # the only check that would catch an image nobody outside the container
+      # can connect to at all.
       - name: Smoke test the published image
         env:
           IMAGE_REF: ghcr.io/${{ github.repository_owner }}/postgres-patch:t${{ inputs.topic_id }}
         run: |
-          docker run -d --name smoke -e POSTGRES_PASSWORD=smoke "$IMAGE_REF"
-          for i in $(seq 1 60); do
-            if docker exec smoke pg_isready -U postgres >/dev/null 2>&1; then
-              echo "server accepted connections after ${i}s"
-              docker exec smoke psql -U postgres -c 'select version()'
-              docker rm -f smoke
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "server did not accept connections within 60s"
-          docker logs smoke
+          docker run -d --name smoke -p 5432:5432 "$IMAGE_REF"
+          bash .ci/scripts/wait_pg_ready.sh smoke 5432 postgres 60 || { docker rm -f smoke; exit 1; }
+          if ! psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -c 'select version()'; then
+            echo "host psql could not connect to the published image"
+            docker logs smoke
+            docker rm -f smoke
+            exit 1
+          fi
           docker rm -f smoke
-          exit 1
 
   # Records the outcome as a git ref in the caller repo - no write token
   # ever touches the source tree, and no 1.5GB fork clone happens just to
