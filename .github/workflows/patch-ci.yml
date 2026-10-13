@@ -18,6 +18,11 @@ on:
       base_sha:
         required: true
         type: string
+      # topic short name; adds a :<slug> tag next to :t<topic_id>
+      slug:
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: hackorum-ci-${{ github.ref }}
@@ -438,6 +443,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # slug re-checked here, not trusted: same rules as hackorum's Topic model
+      - name: Compute image tags
+        id: tags
+        env:
+          BASE: ghcr.io/${{ github.repository_owner }}/postgres-patch
+          TOPIC_ID: ${{ inputs.topic_id }}
+          SLUG: ${{ inputs.slug }}
+        shell: bash
+        run: |
+          tags="$BASE:t$TOPIC_ID"
+          if [ -n "$SLUG" ]; then
+            if [[ "$SLUG" =~ ^[a-z][a-z0-9._-]{1,63}$ && ! "$SLUG" =~ ^(t[0-9]+|latest)$ && "$SLUG" != *..* ]]; then
+              tags="$tags"$'\n'"$BASE:$SLUG"
+            else
+              echo "::warning::ignoring invalid slug"
+            fi
+          fi
+          {
+            echo "list<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # The description label is set here, not in the Dockerfile above -
       # it carries patch commit subjects, which are untrusted mailing-list
       # text, and this job holds a write token. An action input is plain
@@ -449,7 +477,7 @@ jobs:
         with:
           context: ctx
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/postgres-patch:t${{ inputs.topic_id }}
+          tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.description=${{ needs.build-and-test.outputs.image_description }}
 

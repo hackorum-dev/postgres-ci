@@ -1,0 +1,80 @@
+name: hackorum slug tags
+
+# Called from the hackorum-slugs branch of the fork, which hackorum's
+# orchestrator force-pushes when the slug list changes and once a day.
+# Points every postgres-patch:<slug> at the current postgres-patch:t<id>.
+# Runs no patch code: the branch holds only slugs.json and the stub.
+on:
+  workflow_call:
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out slug list
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # slugs come from the file, never spliced into the script
+      - name: Retag
+        env:
+          BASE: ghcr.io/${{ github.repository_owner }}/postgres-patch
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          base = os.environ["BASE"]
+          fmt = re.compile(r"^[a-z][a-z0-9._-]{1,63}$")
+          reserved = re.compile(r"^(t\d+|latest)$")
+          tagged, skipped, failed = [], [], []
+
+          with open("slugs.json") as f:
+              entries = json.load(f)
+
+          for entry in entries:
+              slug = str(entry.get("slug", ""))
+              topic_id = int(entry.get("topic_id", 0))
+              if not fmt.match(slug) or reserved.match(slug) or ".." in slug or topic_id <= 0:
+                  skipped.append(f"{slug!r}: invalid")
+                  continue
+              src = f"{base}:t{topic_id}"
+              probe = subprocess.run(["docker", "buildx", "imagetools", "inspect", src],
+                                     capture_output=True)
+              if probe.returncode != 0:
+                  skipped.append(f"{slug}: no image for t{topic_id}")
+                  continue
+              res = subprocess.run(["docker", "buildx", "imagetools", "create",
+                                    "-t", f"{base}:{slug}", src])
+              (tagged if res.returncode == 0 else failed).append(f"{slug} -> t{topic_id}")
+
+          print(f"tagged {len(tagged)}:")
+          for line in tagged:
+              print(f"  {line}")
+          print(f"skipped {len(skipped)}:")
+          for line in skipped:
+              print(f"  {line}")
+          if failed:
+              print(f"failed {len(failed)}:")
+              for line in failed:
+                  print(f"  {line}")
+              sys.exit(1)
+          PY
