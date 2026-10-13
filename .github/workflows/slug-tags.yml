@@ -58,9 +58,13 @@ jobs:
                   continue
               src = f"{base}:t{topic_id}"
               probe = subprocess.run(["docker", "buildx", "imagetools", "inspect", src],
-                                     capture_output=True)
+                                     capture_output=True, text=True)
               if probe.returncode != 0:
-                  skipped.append(f"{slug}: no image for t{topic_id}")
+                  # only a missing image is a skip; a registry hiccup must fail the run
+                  if "not found" in (probe.stderr + probe.stdout).lower():
+                      skipped.append(f"{slug}: no image for t{topic_id}")
+                  else:
+                      failed.append(f"{slug}: inspect t{topic_id}: {probe.stderr.strip()[:200]}")
                   continue
               res = subprocess.run(["docker", "buildx", "imagetools", "create",
                                     "-t", f"{base}:{slug}", src])
